@@ -898,6 +898,283 @@ return (ExecutionResult.PENDING, None, None)           # 等子图跑完再回�
 
 ---
 
+## 六、内置节点（Core Nodes）：定义位置与常用节点手册
+
+> 本章分两部分：**6.1–6.3** 回答"内置节点定义在哪里、如何被注册"；
+> **6.4–6.11** 按典型工作流的数据流顺序整理常用节点的作用、输入输出与属性配置。
+
+### 6.1 内置节点的三个层级
+
+ComfyUI 的"内置节点"分布在三个位置，注册路径不同：
+
+#### 第 1 层：`nodes.py`（根目录）—— 最核心集合
+
+定义在 `nodes.py` 前半部分（约 1800 行），是支撑 SD 基础工作流的最小集合，
+全部注册进同文件底部的 `NODE_CLASS_MAPPINGS`（`nodes.py:2076`）。
+这些节点**随 `import nodes` 直接生效**，无需任何初始化步骤。
+
+| 类别 | 代表节点（行号） |
+|------|------------------|
+| 模型加载 | `CheckpointLoaderSimple`(:602)、`UNETLoader`(:991)、`CLIPLoader`(:1016)、`VAELoader`(:775)、`LoraLoader`(:713) |
+| 条件编码 | `CLIPTextEncode`(:57)、`Conditioning*` 系列(:81–318) |
+| 采样 | `KSampler`(:1605)、`KSamplerAdvanced`(:1634)、`common_ksampler`(:1580) |
+| Latent | `EmptyLatentImage`(:1254)、`LatentComposite/Crop/Rotate/...` |
+| VAE | `VAEEncode`(:384)、`VAEDecode`(:320) 及 Tiled 版 |
+| 图像 I/O | `SaveImage`(:1668)、`LoadImage`(:1746)、`PreviewImage`(:1729)、`ImageScale`(:1891) |
+| ControlNet 等 | `ControlNetLoader`(:874)、`ControlNetApplyAdvanced`(:940)、`CLIPVision*`、`StyleModel*`、`GLIGEN*` |
+
+#### 第 2 层：`comfy_extras/nodes_*.py`（约 130 个文件）—— 官方扩展
+
+按模型族/功能拆分：`nodes_wan.py`、`nodes_flux.py`、`nodes_qwen.py`、`nodes_video.py`、
+`nodes_logic.py`（App Mode 流程控制）、`nodes_glsl.py`、`nodes_sam3.py` 等。
+
+**关键隐藏约定**：它们**不是自动扫描目录**加载的，而是由
+`init_builtin_extra_nodes()`（`nodes.py:2402`）按一个**显式白名单文件列表**
+（`extras_files = ["nodes_latent.py", ...]`）逐个 `importlib` 导入，
+再把各自的 `NODE_CLASS_MAPPINGS` 合并进全局表。
+→ **新增扩展节点文件必须同时把它加进这个列表，否则不会被注册。**
+
+#### 第 3 层：`comfy_api_nodes/` —— 内置 partner/API 节点
+
+云端服务节点（`nodes_openai.py`、`nodes_gemini.py`、`nodes_bfl.py`、`nodes_kling.py`…），
+由 `init_builtin_api_nodes()`（`nodes.py:2564`）加载——这一层**是** glob 扫描
+`nodes_*.py`，与第 2 层的白名单机制不同。可用 `--disable-partner-nodes` 跳过。
+多数用 V3 声明式 API（`io.ComfyNode` + `define_schema`）编写。
+
+### 6.2 统一注册入口与数据流
+
+```
+main.py → nodes.init_extra_nodes()   (nodes.py:2583)
+   ├── 1. nodes.py 自身            ← import 时已在 NODE_CLASS_MAPPINGS
+   ├── 2. init_builtin_extra_nodes()   → comfy_extras/（显式白名单）
+   ├── 3. init_external_custom_nodes() → custom_nodes/（第三方，load_custom_node）
+   └── 4. init_builtin_api_nodes()     → comfy_api_nodes/（可被 --disable-partner-nodes 关闭）
+```
+
+最终全部汇入同一张 `nodes.NODE_CLASS_MAPPINGS: dict[str, type]`——
+执行引擎只认这张表，无法区分（也不需要区分）节点来自哪层。
+前端通过 `GET /object_info`（`server.py:808`）拿到整张表的序列化描述
+（`node_info()` 函数逐个把类属性翻译成 input/output/description 等 JSON 字段）。
+
+补充：`comfy_extras/nodes_replacements.py` 配合 `app/node_replace_manager.py`
+支持"节点替换映射"——提交 prompt 时 `apply_replacements` 会把旧节点类型换成新实现，
+所以 `class_type` 到执行时偶尔还会经历一次改写。
+
+### 6.3 理解所有节点的三个底层约定
+
+1. **输出槽序号 = `RETURN_TYPES` 元组下标**。CheckpointLoader 的 0/1/2 = MODEL/CLIP/VAE。
+2. **`MODEL`/`CLIP`/`CONDITIONING` 等类型传的是 Python 对象**
+   （`ModelPatcher`、`CLIP`、list of tuples），只有 `IMAGE`/`MASK` 是裸张量；
+   **`LATENT` 是 dict**：`{"samples": tensor, ...}`，可携带 `noise_mask`、
+   `downscale_ratio_spacial` 等元数据——这个约定贯穿所有 latent 节点。
+3. **widget 值与连线共用 `inputs` 字典**（见第五章），
+   带 `default`/`min`/`max` 的输入在 UI 上是旋钮，被连线后自动变成输入槽。
+
+### 6.4 模型加载类节点（工作流的源头）
+
+#### `CheckpointLoaderSimple`（`nodes.py:602`）—— 最常用入口
+- **作用**：加载完整 checkpoint（UNet + CLIP + VAE 三合一），
+  内部走 `comfy.sd.load_checkpoint_guess_config`，自动从 state-dict 猜测模型配置。
+- **输入**：`ckpt_name`（Combo，选项来自 `folder_paths.get_filename_list("checkpoints")`，
+  即 `models/checkpoints/` 目录）。
+- **输出**：`MODEL`、`CLIP`、`VAE` 三槽（`return out[:3]`）。
+- 注：`CheckpointLoader`（:574，需额外 config）与 `DiffusersLoader`（:643）已标
+  `DEPRECATED`，新工作流一律用 Simple 版。
+
+#### 分离式加载：`UNETLoader` + `CLIPLoader`/`DualCLIPLoader` + `VAELoader`
+SD3/Flux/Wan 等新模型的标准做法（checkpoint 拆开分发）：
+
+- `UNETLoader`（:991）：`unet_name`（`models/diffusion_models/`）
+  + 高级选项 `weight_dtype`（`default`/`fp8_e4m3fn`/`fp8_e4m3fn_fast`/`fp8_e5m2`，
+  fp8 量化在这里选）→ 输出 `MODEL`。
+- `CLIPLoader`（:1016）：`clip_name`（`models/text_encoders/`）+ **`type`**
+  （关键参数：决定按哪种模型族组装文本编码器，如 `flux`/`sd3`/`wan`/`qwen_image`；
+  节点 DESCRIPTION 就是配方表——wan→umt5 xxl、lumina2→gemma 2 2B、hidream→llama-3.1 或 t5…）
+  → 输出 `CLIP`。可选高级 `device`（`cpu` 强制编码器驻留 CPU）。
+- `DualCLIPLoader`（:1043）：两个编码器 + type（sdxl = clip-l+clip-g，flux = clip-l+t5）。
+- `VAELoader`（:775）：`vae_name`（`models/vae/`）→ 输出 `VAE`。
+
+#### `LoraLoader`（`nodes.py:713`）
+- **作用**：把 LoRA 补丁应用到 MODEL 和 CLIP 上。
+  **不修改权重本体**，而是给 `ModelPatcher` 挂 patch（见 `comfy/model_patcher.py`）。
+- **输入**：`model`、`clip`、`lora_name`（`models/loras/`）、
+  `strength_model`、`strength_clip`（-100~100，可为负；两者皆 0 时直接透传）。
+- **输出**：修改后的 `MODEL`、`CLIP`。可**串联多个 LoRA 节点**逐级叠加。
+- 实例字段 `self.loaded_lora` 缓存已读文件——这是"节点实例按 node_id 缓存、
+  同一 prompt 内复用"机制（`execution.py:498`）的实际受益例子。
+- `LoraLoaderModelOnly`（:760）：只改 MODEL 的简化版。
+
+### 6.5 条件编码类节点（提示词）
+
+#### `CLIPTextEncode`（`nodes.py:57`）—— 每条工作流至少两个
+- **作用**：文本 prompt → `CONDITIONING`（引导采样的嵌入）。
+- **输入**：`text`（STRING，`multiline=True`、`dynamicPrompts=True`）、`clip`（CLIP）。
+- **输出**：`CONDITIONING`。
+- 惯例：一正一负两个实例，分别接 KSampler 的 `positive`/`negative`。
+- clip 为 None 时抛出带自诊断信息的错误（checkpoint 缺 text encoder 的典型症状）。
+
+#### 条件变换节点（`nodes.py:81`–`457`）
+
+| 节点 | 输入 | 用途 |
+|------|------|------|
+| `ConditioningCombine` | cond_1, cond_2 | 两条条件拼接（list 相加） |
+| `ConditioningAverage` | to, from, `conditioning_to_strength`(0~1) | 加权混合两个 prompt（含 pooled_output） |
+| `ConditioningSetArea(Percentage/Strength)` | cond, x/y/w/h, strength | 把条件限制在画面某区域 |
+| `ConditioningSetMask` | cond, mask, set_on_bonus… | 把条件限制在掩码区 |
+| `ConditioningZeroOut` | cond | 条件清零（纯 unconditional 引导） |
+| `ConditioningSetTimestepRange` | cond, start/end | 条件只在采样区间生效 |
+
+### 6.6 Latent 准备类节点
+
+#### `EmptyLatentImage`（`nodes.py:1254`）—— 文生图必用
+- **输入**：`width`/`height`（默认 1024，min 16，step 8）、`batch_size`（1~4096）。
+- **输出**：`LATENT` = `{"samples": zeros([B,4,H/8,W/8]), "downscale_ratio_spacial": 8}`。
+- 宽高必须 8 的倍数（VAE 空间压缩率）；4 通道是 SD1/SDXL 约定，
+  SD3/Flux 等由 `comfy.sample.fix_empty_latent_channels` 在采样时自动纠正通道数。
+
+#### `VAEEncode`（:384）/ `VAEDecode`（:320）—— 像素↔latent 的桥
+- `VAEEncode`：`pixels`(IMAGE) + `vae` → `LATENT`。图生图链路：
+  `LoadImage → VAEEncode → KSampler.latent_image`。
+- `VAEDecode`：`samples`(LATENT) + `vae` → IMAGE；5 维（视频）自动展平 batch。
+- 低显存替代：`VAEEncodeTiled`/`VAEDecodeTiled`（:398/:347），
+  参数 `tile_size`（默认 512）、`overlap`（64）、视频 VAE 另有
+  `temporal_size`/`temporal_overlap`；内部按 `spacial_compression_decode()`
+  换算 latent 尺寸后调 `vae.decode_tiled`。
+
+#### inpaint 相关
+- `SetLatentNoiseMask`（:1566）：给 latent 挂 `noise_mask` —— inpaint 核心，
+  掩码区域全重绘、其余保持（配合 KSampler `denoise=1.0`）。
+- `VAEEncodeForInpaint`（:416）：带模糊边缘的传统 inpaint 编码
+  （grow_mask_by 参数控制掩码扩张像素）。
+
+### 6.7 采样类节点（工作流的心脏）
+
+#### `KSampler`（`nodes.py:1605`）—— 最核心节点
+
+| 输入 | 类型 | 常用值 / 说明 |
+|------|------|---------------|
+| `model` | MODEL | 来自 checkpoint/LoRA |
+| `seed` | INT | 0~2^64；`control_after_generate` 可设 randomize/fixed/increase/decrease；**同 seed + 同输入 = 可复现** |
+| `steps` | INT | 20~30 常见；turbo 蒸馏模型 4~8 |
+| `cfg` | FLOAT | 5~8 常见；Flux 类 guidance-distill 模型常设 1 |
+| `sampler_name` | COMBO | `comfy.samplers.KSampler.SAMPLERS`：euler、euler_ancestral、dpmpp_2m(_sde)、ddim、uni_pc… |
+| `scheduler` | COMBO | normal、**karras**（多数模型推荐）、simple、sgm_uniform、bb、align_your_steps |
+| `positive` / `negative` | CONDITIONING | 两个 CLIPTextEncode 的输出 |
+| `latent_image` | LATENT | EmptyLatentImage 或 VAEEncode |
+| `denoise` | FLOAT | 1.0 全重绘；图生图风格迁移常用 0.4~0.75 |
+
+- **输出**：`LATENT`（去噪完成）。
+- 全部委托 `common_ksampler`（:1580）→ `comfy.sample.sample()`；
+  `latent` dict 里的 `noise_mask`/`batch_index` 会在这里被消费。
+- `OUTPUT_TOOLTIPS`/`DESCRIPTION`/`SEARCH_ALIASES` 只影响前端展示与搜索。
+
+#### `KSamplerAdvanced`（`nodes.py:1634`）
+在 KSampler 基础上把内部参数暴露出来：
+- `add_noise`（enable/disable）：disable = 不做去噪直接透传（用于纯 img2img 编码链）；
+- `start_at_step` / `end_at_step`：**分段采样**——高流程（hires fix）两阶段、
+  ControlNet 分区间生效都靠它；
+- `return_with_leftover_noise`（enable → `force_full_denoise=False`）：
+  输出带残留噪声的 latent，接**下一个** KSamplerAdvanced 从 `start_at_step` 接续。
+
+#### 采样扩展（`comfy_extras/nodes_custom_sampler.py`）
+`BasicScheduler`、`KSamplerSelect`、`CustomSampler`、`ManualSigmas`、
+`AlignYourStepsScheduler` 等把 sampler/scheduler/noise 拆成独立节点，
+输出 `SAMPLER`/`SIGMAS`/`NOISE`/`GUIDER` 供 `SamplerCustom` 组合。
+需要精确控制 sigma 曲线时才用，普通工作流不必。
+
+### 6.8 图像 I/O 与后处理类节点
+
+#### `SaveImage`（`nodes.py:1668`）—— 终端输出节点（`OUTPUT_NODE = True`）
+- **输入**：`images`(IMAGE)、`filename_prefix`（STRING，
+  支持 `%date:yyyy-MM-dd%`、`%Empty Latent Image.width%` 等宏）。
+- **hidden 输入**：`PROMPT` + `EXTRA_PNGINFO` ——
+  **把完整工作流 JSON 写进 PNG 元数据**，这就是把图片拖回 ComfyUI
+  能还原工作流的原理（`--disable-metadata` 可关）。
+- **输出**：`images` 透传（`RETURN_NAMES=("images",)`），方便下游继续接节点。
+- 实例字段（`output_dir`/`type`/`compress_level`）在 `__init__` 里设定——
+  利用节点实例缓存做轻量状态。
+- `PreviewImage`（:1729）继承自它：写 temp 目录、不落正式输出、低压缩。
+
+#### `LoadImage`（`nodes.py:1746`）
+- **输入**：`image`（Combo + `image_upload: True` → 节点上可直接拖拽上传，文件入 `input/`）。
+- **输出**：`IMAGE` + `MASK`（PNG alpha → 掩码；无 alpha 输出 64×64 全零掩码）。
+- 实现了 `IS_CHANGED`（对文件做 sha256 —— **文件被替换即使文件名不变也能正确失效缓存**）
+  和 `VALIDATE_INPUTS`（路径合法性）。
+- `LoadImageMask`（:1823）：只取掩码，可选 alpha/red/green/blue 通道。
+
+#### 图像工具
+
+| 节点 | 关键参数 | 说明 |
+|------|----------|------|
+| `ImageScale`(:1891) | `upscale_method`(nearest-exact/bilinear/area/bicubic/lanczos)、width/height（0=等比）、crop(disabled/center) | 图生图前保证尺寸 8 倍数 |
+| `ImageScaleBy`(:1923) | `scale_by`(0.01~8) | 按倍数缩放 |
+| `ImageBatch`(:1963) | image1, image2 | 拼 batch（已 DEPRECATED） |
+| `ImageInvert`(:1944) / `EmptyImage`(:1987) / `ImagePadForOutpaint`(:2011) | — | 小工具 |
+
+### 6.9 ControlNet 类节点
+
+- `ControlNetLoader`（`nodes.py:874`）：`control_net_name` → `CONTROL_NET`。
+- `ControlNetApplyAdvanced`（`nodes.py:940`）：
+  输入 `positive`/`negative`/`control_net`/`image`，
+  参数 `strength`（0~2+）、`start_percent`/`end_percent`
+  （**只在采样的这个进度区间生效**，如 0.0~0.6 让结构约束前期起效、后期放开细节）。
+  输出仍是 CONDITIONING，可**串联叠加多个 ControlNet**。
+- 预处理器：`Canny`（`comfy_extras/nodes_canny.py`，low/high_threshold → 边缘 MASK）、
+  `Depth Anything 3`（`nodes_depth_anything_3.py`）、`SDPose`（`nodes_sdpose.py`）等。
+
+### 6.10 常用 extras 节点速查
+
+| 节点（文件） | 一句话用途 |
+|---|---|
+| `UpscaleModelLoader` + `ImageUpscaleWithModel`（`nodes_upscale_model.py`） | Real-ESRGAN 等模型放大 |
+| `CheckpointSave`/`CheckpointLoader`、`ModelMergeSimple`（`nodes_model_merging.py`） | 模型融合、保存 |
+| `LatentUpscale`/`LatentUpscaleBy`（`nodes.py:1341/1398`） | latent 空间放大（hires fix 第一式） |
+| `PrimitiveNode`（`nodes_primitive.py`） | 快捷数值/字符串输入，可输出任意类型 |
+| `PreviewAny`（`nodes_preview_any.py`） | 调试查看任意类型 |
+| `SaveVideo`/`LoadVideo`/`PreviewVideo`（`nodes_video.py`） | 视频工作流 I/O 三件套 |
+| `SaveAudio`/`PreviewAudio`（`nodes_audio.py`） | 音频工作流 I/O |
+| `KSamplerSelect`/`BasicScheduler`/`CustomSampler`（`nodes_custom_sampler.py`） | 采样组件化 |
+| `Note`（前端节点） | 画布注释（纯前端，无后端实现） |
+
+### 6.11 一条最小文生图链路的连线全景
+
+```
+CheckpointLoaderSimple
+ ├─[0]MODEL ──→ LoraLoader ──→ KSampler.model
+ ├─[1]CLIP ──→ CLIPTextEncode(正) ──→ KSampler.positive
+ │          └→ CLIPTextEncode(负) ──→ KSampler.negative
+ └─[2]VAE ─────────────────────────→ VAEDecode.vae
+EmptyLatentImage ──→ KSampler.latent_image
+KSampler ──→ VAEDecode ──→ SaveImage
+```
+
+对应的后端 prompt dict（连线即 `[node_id, 槽序号]`，见第五章）：
+
+```python
+{
+  "1": {"class_type": "CheckpointLoaderSimple",
+        "inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}},
+  "2": {"class_type": "CLIPTextEncode",
+        "inputs": {"text": "a cat", "clip": ["1", 1]}},
+  "3": {"class_type": "CLIPTextEncode",
+        "inputs": {"text": "ugly", "clip": ["1", 1]}},
+  "4": {"class_type": "EmptyLatentImage",
+        "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+  "5": {"class_type": "KSampler",
+        "inputs": {"seed": 42, "steps": 20, "cfg": 8.0,
+                   "sampler_name": "dpmpp_2m", "scheduler": "karras",
+                   "denoise": 1.0,
+                   "model": ["1", 0], "positive": ["2", 0],
+                   "negative": ["3", 0], "latent_image": ["4", 0]}},
+  "6": {"class_type": "VAEDecode",
+        "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+  "7": {"class_type": "SaveImage",
+        "inputs": {"images": ["6", 0], "filename_prefix": "ComfyUI"}}
+}
+```
+
+---
+
 ## 附：快速定位表（研究时常用）
 
 | 我想看…                 | 去这里                                                                                                      |
@@ -909,6 +1186,7 @@ return (ExecutionResult.PENDING, None, None)           # 等子图跑完再回�
 | 输入类型校验             | `execution.py:846` `validate_inputs` / `execution.py:1138` `validate_prompt`                        |
 | 核心节点样例             | `nodes.py:1605` `KSampler`、`nodes.py:602` `CheckpointLoaderSimple`、`nodes.py:320` `VAEDecode` |
 | 自定义节点加载           | `nodes.py:2254` `load_custom_node()` / `nodes.py:2583` `init_extra_nodes()`                         |
+| 内置扩展节点白名单       | `nodes.py:2402` `init_builtin_extra_nodes()` 的 `extras_files` 列表 → `comfy_extras/`              |
 | v3 声明式节点 API        | `comfy_api/latest/_io.py`、`comfy_api/latest/_input/`、`comfy_api/internal/`                          |
 | 模型自动识别             | `comfy/sd.py` + `comfy/model_detection.py` + `comfy/supported_models.py`                              |
 | 显存/卸载/多卡           | `comfy/model_management.py`、`comfy/multigpu.py`、`comfy/memory_management.py`                        |
